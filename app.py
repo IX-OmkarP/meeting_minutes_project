@@ -1,6 +1,5 @@
 import streamlit as st
 from openai import OpenAI
-from pydub import AudioSegment
 import tempfile
 import os
 from dotenv import load_dotenv
@@ -21,13 +20,6 @@ client = OpenAI(api_key=API_KEY)
 st.set_page_config(page_title="AI Meeting Minutes Generator", layout="centered")
 st.title("🎙️ AI Meeting Minutes Generator")
 st.write("Upload any meeting recording and get professional Meeting Minutes instantly.")
-
-# ---------------- Audio Conversion ----------------
-def convert_to_wav(input_path, output_path):
-    """Convert audio to 16kHz mono 16-bit WAV for Whisper API."""
-    audio = AudioSegment.from_file(input_path)
-    audio = audio.set_channels(1).set_frame_rate(16000).set_sample_width(2)
-    audio.export(output_path, format="wav")
 
 # ---------------- Transcription ----------------
 def transcribe_audio(file_path):
@@ -92,19 +84,15 @@ if uploaded_file:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, uploaded_file.name)
-        wav_path = os.path.join(tmpdir, "audio.wav")
 
         # Save uploaded file temporarily
         with open(input_path, "wb") as f:
             f.write(uploaded_file.read())
 
-        # Convert to compatible WAV
-        convert_to_wav(input_path, wav_path)
-
-        # Transcribe audio
+        # Transcribe audio directly (OpenAI Whisper supports multiple formats)
         st.info("Transcribing audio using OpenAI API...")
         try:
-            transcript = transcribe_audio(wav_path)
+            transcript = transcribe_audio(input_path)
         except Exception as e:
             st.error(f"Transcription failed: {e}")
             st.stop()
