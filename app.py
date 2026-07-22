@@ -6,10 +6,14 @@ from dotenv import load_dotenv
 from datetime import datetime
 from pydub import AudioSegment
 
+from transcription_utils import get_chunk_windows
+
 # Groq free-tier upload limit is 25 MB. Stay safely under it.
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
-# 10 min per chunk at 16 kHz mono is well under the size limit.
-CHUNK_MS = 10 * 60 * 1000
+# Keep chunks conservative to avoid the 413 request-too-large error.
+MAX_CHUNK_MS = 10 * 60 * 1000
+MIN_CHUNK_MS = 60 * 1000
+TARGET_BITRATE_KBPS = 32
 
 # ---------------- Load .env ----------------
 load_dotenv()
@@ -40,24 +44,40 @@ def _transcribe_file(file_path):
 
 def transcribe_audio(file_path):
     """Downsample audio, then transcribe. Chunk if still over the size limit."""
-    # Downsample to 16 kHz mono — Groq's recommended format, shrinks file a lot.
     audio = AudioSegment.from_file(file_path).set_frame_rate(16000).set_channels(1)
 
+    original_size_bytes = os.path.getsize(file_path)
     tmpdir = os.path.dirname(file_path)
     compressed_path = os.path.join(tmpdir, "compressed.mp3")
-    audio.export(compressed_path, format="mp3", bitrate="64k")
+    audio.export(compressed_path, format="mp3", bitrate=f"{TARGET_BITRATE_KBPS}k")
+    compressed_size_bytes = os.path.getsize(compressed_path)
 
-    # If it fits, transcribe in one call.
-    if os.path.getsize(compressed_path) <= MAX_UPLOAD_BYTES:
+    st.info(
+        f"Upload size: {original_size_bytes / (1024 * 1024):.2f} MB → compressed size: {compressed_size_bytes / (1024 * 1024):.2f} MB"
+    )
+
+    if compressed_size_bytes <= MAX_UPLOAD_BYTES:
         return _transcribe_file(compressed_path)
 
-    # Otherwise split into time chunks and stitch transcripts together.
+    windows = get_chunk_windows(
+        total_ms=len(audio),
+        max_bytes=MAX_UPLOAD_BYTES,
+        max_chunk_ms=MAX_CHUNK_MS,
+        bitrate_kbps=TARGET_BITRATE_KBPS,
+        min_chunk_ms=MIN_CHUNK_MS,
+    )
+    st.info(f"Audio was split into {len(windows)} chunk(s) for transcription.")
+
+    if not windows:
+        raise ValueError("Unable to prepare audio for transcription")
+
     parts = []
-    for i, start in enumerate(range(0, len(audio), CHUNK_MS)):
-        chunk = audio[start:start + CHUNK_MS]
+    for i, (start_ms, end_ms) in enumerate(windows):
+        chunk = audio[start_ms:end_ms]
         chunk_path = os.path.join(tmpdir, f"chunk_{i}.mp3")
-        chunk.export(chunk_path, format="mp3", bitrate="64k")
+        chunk.export(chunk_path, format="mp3", bitrate=f"{TARGET_BITRATE_KBPS}k")
         parts.append(_transcribe_file(chunk_path))
+
     return " ".join(parts)
 
 # ---------------- Corporate MoM Generation ----------------
