@@ -4,6 +4,12 @@ import tempfile
 import os
 from dotenv import load_dotenv
 from datetime import datetime
+from pydub import AudioSegment
+
+# Groq free-tier upload limit is 25 MB. Stay safely under it.
+MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+# 10 min per chunk at 16 kHz mono is well under the size limit.
+CHUNK_MS = 10 * 60 * 1000
 
 # ---------------- Load .env ----------------
 load_dotenv()
@@ -22,14 +28,37 @@ st.title("🎙️ AI Meeting Minutes Generator")
 st.write("Upload any meeting recording and get professional Meeting Minutes instantly.")
 
 # ---------------- Transcription ----------------
-def transcribe_audio(file_path):
-    """Transcribe audio using Groq Whisper API."""
+def _transcribe_file(file_path):
+    """Send one audio file to Groq Whisper and return its text."""
     with open(file_path, "rb") as audio_file:
         transcript = client.audio.transcriptions.create(
             model="whisper-large-v3",
             file=audio_file
         )
     return transcript.text
+
+
+def transcribe_audio(file_path):
+    """Downsample audio, then transcribe. Chunk if still over the size limit."""
+    # Downsample to 16 kHz mono — Groq's recommended format, shrinks file a lot.
+    audio = AudioSegment.from_file(file_path).set_frame_rate(16000).set_channels(1)
+
+    tmpdir = os.path.dirname(file_path)
+    compressed_path = os.path.join(tmpdir, "compressed.mp3")
+    audio.export(compressed_path, format="mp3", bitrate="64k")
+
+    # If it fits, transcribe in one call.
+    if os.path.getsize(compressed_path) <= MAX_UPLOAD_BYTES:
+        return _transcribe_file(compressed_path)
+
+    # Otherwise split into time chunks and stitch transcripts together.
+    parts = []
+    for i, start in enumerate(range(0, len(audio), CHUNK_MS)):
+        chunk = audio[start:start + CHUNK_MS]
+        chunk_path = os.path.join(tmpdir, f"chunk_{i}.mp3")
+        chunk.export(chunk_path, format="mp3", bitrate="64k")
+        parts.append(_transcribe_file(chunk_path))
+    return " ".join(parts)
 
 # ---------------- Corporate MoM Generation ----------------
 def generate_minutes(transcript, meeting_title, location, date, time, attendees):
