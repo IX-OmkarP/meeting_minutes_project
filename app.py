@@ -4,7 +4,16 @@ import tempfile
 import os
 from dotenv import load_dotenv
 from datetime import datetime
-from pydub import AudioSegment
+try:
+    from pydub import AudioSegment
+except Exception as e:
+    st.error(
+        "Audio processing dependency failure: pydub failed to import. "
+        "This environment may be missing the native `audioop` module required by pydub. "
+        "Ensure you are running CPython with the audioop extension available, or install/run this app in an environment that includes ffmpeg and pydub.\n"
+        f"Import error: {e}"
+    )
+    st.stop()
 
 from transcription_utils import get_chunk_windows
 
