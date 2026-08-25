@@ -15,7 +15,7 @@ except Exception as e:
     )
     st.stop()
 
-from transcription_utils import get_chunk_windows
+from transcription_utils import choose_chat_model, get_chunk_windows, strip_markdown
 
 # Groq free-tier upload limit is 25 MB. Stay safely under it.
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
@@ -35,6 +35,15 @@ if not API_KEY:
 # Initialize Groq client
 client = Groq(api_key=API_KEY)
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def pick_chat_model():
+    """First available Groq chat model for this key (cached for an hour)."""
+    return choose_chat_model(
+        (m.id for m in client.models.list().data),
+        override=os.getenv("GROQ_CHAT_MODEL"),
+    )
+
+
 # ---------------- Streamlit UI ----------------
 st.set_page_config(page_title="AI Meeting Minutes Generator", layout="centered")
 st.title("🎙️ AI Meeting Minutes Generator")
@@ -52,17 +61,34 @@ def _transcribe_file(file_path):
 
 
 def transcribe_audio(file_path):
-    """Downsample audio, then transcribe. Chunk if still over the size limit."""
-    audio = AudioSegment.from_file(file_path).set_frame_rate(16000).set_channels(1)
+    """Transcribe. Only decode/compress when the file is over the upload limit.
 
+    Groq accepts mp3/m4a/wav/ogg/mp4 directly, so a small file needs no ffmpeg.
+    """
     original_size_bytes = os.path.getsize(file_path)
+
+    if original_size_bytes <= MAX_UPLOAD_BYTES:
+        st.info(f"Upload size: {original_size_bytes / (1024 * 1024):.2f} MB - sending as-is.")
+        return _transcribe_file(file_path)
+
+    try:
+        audio = AudioSegment.from_file(file_path).set_frame_rate(16000).set_channels(1)
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"This recording is {original_size_bytes / (1024 * 1024):.0f} MB, over the "
+            f"{MAX_UPLOAD_BYTES / (1024 * 1024):.0f} MB limit, so it must be compressed first - "
+            "and that needs ffmpeg, which was not found on PATH. "
+            "Install it (Windows: `winget install Gyan.FFmpeg`) and restart the app, "
+            "or upload a smaller recording."
+        ) from e
+
     tmpdir = os.path.dirname(file_path)
     compressed_path = os.path.join(tmpdir, "compressed.mp3")
-    audio.export(compressed_path, format="mp3", bitrate=f"{TARGET_BITRATE_KBPS}k")
+    audio.export(compressed_path, format="mp3", bitrate=f"{TARGET_BITRATE_KBPS}k").close()
     compressed_size_bytes = os.path.getsize(compressed_path)
 
     st.info(
-        f"Upload size: {original_size_bytes / (1024 * 1024):.2f} MB → compressed size: {compressed_size_bytes / (1024 * 1024):.2f} MB"
+        f"Upload size: {original_size_bytes / (1024 * 1024):.2f} MB -> compressed size: {compressed_size_bytes / (1024 * 1024):.2f} MB"
     )
 
     if compressed_size_bytes <= MAX_UPLOAD_BYTES:
@@ -84,7 +110,7 @@ def transcribe_audio(file_path):
     for i, (start_ms, end_ms) in enumerate(windows):
         chunk = audio[start_ms:end_ms]
         chunk_path = os.path.join(tmpdir, f"chunk_{i}.mp3")
-        chunk.export(chunk_path, format="mp3", bitrate=f"{TARGET_BITRATE_KBPS}k")
+        chunk.export(chunk_path, format="mp3", bitrate=f"{TARGET_BITRATE_KBPS}k").close()
         parts.append(_transcribe_file(chunk_path))
 
     return " ".join(parts)
@@ -112,14 +138,16 @@ Instructions:
 - Decisions and Action Items must be in bullet points.
 - Do NOT include 'Next Steps', 'Adjournment', 'Next Meeting', 'Minutes Prepared by', or any placeholders.
 - Maintain professional corporate formatting.
+- Output PLAIN TEXT only. No markdown whatsoever: no asterisks (*), no hash (#) headings, no bold, no italics.
+- Use a hyphen (-) for every bullet point.
 """
 
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=pick_chat_model(),
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3
     )
-    return response.choices[0].message.content
+    return strip_markdown(response.choices[0].message.content)
 
 # ---------------- User Inputs ----------------
 uploaded_file = st.file_uploader(
@@ -137,7 +165,9 @@ attendees = st.text_area("Attendance (comma-separated)", "Lisa Heitrich, Omkar P
 if uploaded_file:
     st.audio(uploaded_file)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    # ignore_cleanup_errors: on Windows ffmpeg/antivirus can still hold a handle
+    # when the block exits, and a failed rmtree would otherwise mask the real error.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
         input_path = os.path.join(tmpdir, uploaded_file.name)
 
         # Save uploaded file temporarily

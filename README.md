@@ -96,7 +96,7 @@ CP_MInute/
 | Task | Model |
 |------|-------|
 | Transcription | `whisper-large-v3` (Groq) |
-| MoM Generation | `llama-3.3-70b-versatile` (Groq) |
+| MoM Generation | best free Groq chat model your key has (`llama-3.3-70b-versatile` preferred, falls back automatically) |
 
 ## Supported Audio Formats
 
@@ -107,3 +107,4 @@ CP_MInute/
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `GROQ_API_KEY` | Yes | Groq API key for Whisper + LLaMA |
+| `GROQ_CHAT_MODEL` | No | Pin a specific Groq chat model instead of auto-selecting |
