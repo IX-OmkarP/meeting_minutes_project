@@ -3,4 +3,4 @@ groq
 python-dotenv
 pydub
 audioop-lts; python_version >= "3.13"
-ffmpeg-python
+imageio-ffmpeg

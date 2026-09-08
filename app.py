@@ -1,7 +1,9 @@
 import streamlit as st
 from groq import Groq
+import subprocess
 import tempfile
 import os
+import imageio_ffmpeg
 from dotenv import load_dotenv
 from datetime import datetime
 try:
@@ -16,6 +18,12 @@ except Exception as e:
     st.stop()
 
 from transcription_utils import choose_chat_model, get_chunk_windows, strip_markdown
+
+# Use the ffmpeg binary shipped by imageio-ffmpeg so no system package is needed.
+# Streamlit Cloud's apt step is broken by an expired Debian repo, so packages.txt
+# cannot be used to install ffmpeg there.
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+AudioSegment.converter = FFMPEG
 
 # Groq free-tier upload limit is 25 MB. Stay safely under it.
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
@@ -60,6 +68,26 @@ def _transcribe_file(file_path):
     return transcript.text
 
 
+def _decode_to_mono_16k(file_path, tmpdir):
+    """Decode any supported upload to a 16 kHz mono wav and load it.
+
+    Going through wav on disk keeps pydub on its stdlib `wave` path, which needs no
+    ffprobe - imageio-ffmpeg ships ffmpeg only.
+    """
+    wav_path = os.path.join(tmpdir, "decoded.wav")
+    result = subprocess.run(
+        [FFMPEG, "-y", "-i", file_path, "-vn", "-ac", "1", "-ar", "16000", wav_path],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "ffmpeg could not decode this recording, so it cannot be compressed for "
+            f"upload. ffmpeg said: {result.stderr.strip()[-500:]}"
+        )
+    return AudioSegment.from_file(wav_path, format="wav")
+
+
 def transcribe_audio(file_path):
     """Transcribe. Only decode/compress when the file is over the upload limit.
 
@@ -71,18 +99,8 @@ def transcribe_audio(file_path):
         st.info(f"Upload size: {original_size_bytes / (1024 * 1024):.2f} MB - sending as-is.")
         return _transcribe_file(file_path)
 
-    try:
-        audio = AudioSegment.from_file(file_path).set_frame_rate(16000).set_channels(1)
-    except FileNotFoundError as e:
-        raise RuntimeError(
-            f"This recording is {original_size_bytes / (1024 * 1024):.0f} MB, over the "
-            f"{MAX_UPLOAD_BYTES / (1024 * 1024):.0f} MB limit, so it must be compressed first - "
-            "and that needs ffmpeg, which was not found on PATH. "
-            "Install it (Windows: `winget install Gyan.FFmpeg`) and restart the app, "
-            "or upload a smaller recording."
-        ) from e
-
     tmpdir = os.path.dirname(file_path)
+    audio = _decode_to_mono_16k(file_path, tmpdir)
     compressed_path = os.path.join(tmpdir, "compressed.mp3")
     audio.export(compressed_path, format="mp3", bitrate=f"{TARGET_BITRATE_KBPS}k").close()
     compressed_size_bytes = os.path.getsize(compressed_path)
