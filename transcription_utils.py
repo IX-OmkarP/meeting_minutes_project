@@ -15,7 +15,19 @@ def get_chunk_windows(
     min_chunk_ms: int,
 ):
     """Split a total duration into time windows that should stay within a byte budget."""
-    if total_ms <= 0:
+    if total_ms < 0:
+        raise ValueError("total_ms must be non-negative")
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be greater than 0")
+    if max_chunk_ms <= 0:
+        raise ValueError("max_chunk_ms must be greater than 0")
+    if min_chunk_ms <= 0:
+        raise ValueError("min_chunk_ms must be greater than 0")
+    if max_chunk_ms < min_chunk_ms:
+        raise ValueError("max_chunk_ms cannot be smaller than min_chunk_ms")
+    if bitrate_kbps <= 0:
+        raise ValueError("bitrate_kbps must be greater than 0")
+    if total_ms == 0:
         return []
 
     def split(start_ms: int, end_ms: int):
@@ -30,6 +42,9 @@ def get_chunk_windows(
             return [(start_ms, end_ms)]
 
         midpoint = start_ms + (duration_ms // 2)
+        if midpoint == start_ms or midpoint == end_ms:
+            return [(start_ms, end_ms)]
+
         return split(start_ms, midpoint) + split(midpoint, end_ms)
 
     return split(0, total_ms)
