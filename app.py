@@ -4,8 +4,8 @@ import subprocess
 import tempfile
 import os
 import imageio_ffmpeg
+import json
 from dotenv import load_dotenv
-from datetime import datetime
 try:
     from pydub import AudioSegment
 except Exception as e:
@@ -17,7 +17,13 @@ except Exception as e:
     )
     st.stop()
 
-from transcription_utils import choose_chat_model, get_chunk_windows, strip_markdown
+from transcription_utils import (
+    choose_chat_model,
+    generate_new_version,
+    get_chunk_windows,
+    minutes_to_html,
+    strip_markdown,
+)
 
 # Use the ffmpeg binary shipped by imageio-ffmpeg so no system package is needed.
 # Streamlit Cloud's apt step is broken by an expired Debian repo, so packages.txt
@@ -96,7 +102,6 @@ def transcribe_audio(file_path):
     original_size_bytes = os.path.getsize(file_path)
 
     if original_size_bytes <= MAX_UPLOAD_BYTES:
-        st.info(f"Upload size: {original_size_bytes / (1024 * 1024):.2f} MB - sending as-is.")
         return _transcribe_file(file_path)
 
     tmpdir = os.path.dirname(file_path)
@@ -104,10 +109,6 @@ def transcribe_audio(file_path):
     compressed_path = os.path.join(tmpdir, "compressed.mp3")
     audio.export(compressed_path, format="mp3", bitrate=f"{TARGET_BITRATE_KBPS}k").close()
     compressed_size_bytes = os.path.getsize(compressed_path)
-
-    st.info(
-        f"Upload size: {original_size_bytes / (1024 * 1024):.2f} MB -> compressed size: {compressed_size_bytes / (1024 * 1024):.2f} MB"
-    )
 
     if compressed_size_bytes <= MAX_UPLOAD_BYTES:
         return _transcribe_file(compressed_path)
@@ -119,8 +120,6 @@ def transcribe_audio(file_path):
         bitrate_kbps=TARGET_BITRATE_KBPS,
         min_chunk_ms=MIN_CHUNK_MS,
     )
-    st.info(f"Audio was split into {len(windows)} chunk(s) for transcription.")
-
     if not windows:
         raise ValueError("Unable to prepare audio for transcription")
 
@@ -134,26 +133,21 @@ def transcribe_audio(file_path):
     return " ".join(parts)
 
 # ---------------- Corporate MoM Generation ----------------
-def generate_minutes(transcript, meeting_title, location, date, time, attendees):
+def generate_minutes(transcript, temperature=0.3):
     prompt = f"""
-You are a professional assistant. Convert the following transcript into a corporate-style Meeting Minutes exactly in this format:
-
-Meeting Minutes – {meeting_title}
-
-Location:           {location}
-Date:               {date}
-Time:               {time}
-
-Attendance
-{attendees}
+You are a professional assistant. Summarize the meeting transcript below into exactly three sections, in this order, and nothing else:
 
 Agenda
+Decisions
+Action Items
+
+Transcript:
 {transcript}
 
 Instructions:
-- Clearly separate Agenda, Decisions, and Action Items.
-- Agenda should summarize discussion points in full sentences.
-- Decisions and Action Items must be in bullet points.
+- Output ONLY these three sections. No title, heading, preamble, closing remarks, or any other section.
+- Agenda, Decisions, and Action Items must all be in bullet points.
+- Each Agenda bullet should summarize one discussion point in a full sentence.
 - Do NOT include 'Next Steps', 'Adjournment', 'Next Meeting', 'Minutes Prepared by', or any placeholders.
 - Maintain professional corporate formatting.
 - Output PLAIN TEXT only. No markdown whatsoever: no asterisks (*), no hash (#) headings, no bold, no italics.
@@ -163,7 +157,7 @@ Instructions:
     response = client.chat.completions.create(
         model=pick_chat_model(),
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.3
+        temperature=temperature
     )
     return strip_markdown(response.choices[0].message.content)
 
@@ -173,70 +167,143 @@ uploaded_file = st.file_uploader(
     type=["mp3", "wav", "m4a", "ogg", "mp4"]
 )
 
-meeting_title = st.text_input("Meeting Title", "CorePoint Client Call")
-location = st.text_input("Location", "Pune")
-date = st.date_input("Date", datetime.now())
-time = st.time_input("Time", datetime.now())
-attendees = st.text_area("Attendance (comma-separated)", "Lisa Heitrich, Omkar Pawar, Chinmay Dole")
-
 # ---------------- Process Upload ----------------
 if uploaded_file:
     st.audio(uploaded_file)
 
-    # ignore_cleanup_errors: on Windows ffmpeg/antivirus can still hold a handle
-    # when the block exits, and a failed rmtree would otherwise mask the real error.
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
-        input_path = os.path.join(tmpdir, uploaded_file.name)
+    # Every widget click reruns this script, so transcript and versions live in
+    # session_state; only a new upload triggers transcription again.
+    if st.session_state.get("file_id") != uploaded_file.file_id:
+        # ignore_cleanup_errors: on Windows ffmpeg/antivirus can still hold a handle
+        # when the block exits, and a failed rmtree would otherwise mask the real error.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            input_path = os.path.join(tmpdir, uploaded_file.name)
 
-        # Save uploaded file temporarily
-        with open(input_path, "wb") as f:
-            f.write(uploaded_file.read())
+            # Save uploaded file temporarily
+            with open(input_path, "wb") as f:
+                f.write(uploaded_file.getvalue())
 
-        # Transcribe directly
-        st.info("Transcribing audio using Groq Whisper...")
-        try:
-            transcript = transcribe_audio(input_path)
-        except Exception as e:
-            st.error(f"Transcription failed: {e}")
-            st.stop()
+            with st.spinner("Transcribing audio using Groq Whisper..."):
+                try:
+                    transcript = transcribe_audio(input_path)
+                except Exception as e:
+                    st.error(f"Transcription failed: {e}")
+                    st.stop()
 
-        st.subheader("📄 Transcript")
-        st.text_area(
-            label="Transcript Output",
-            value=transcript,
-            height=220,
-            label_visibility="collapsed"
+        with st.spinner("Generating professional Meeting Minutes..."):
+            try:
+                first_version = generate_minutes(transcript)
+            except Exception as e:
+                st.error(f"Meeting minutes generation failed: {e}")
+                st.stop()
+
+        st.session_state.update(
+            file_id=uploaded_file.file_id,
+            transcript=transcript,
+            versions=[first_version],
+            version=0,
         )
 
-        st.markdown("---")
+    transcript = st.session_state.transcript
+    versions = st.session_state.versions
 
-        # Generate corporate Meeting Minutes
-        st.info("Generating professional Meeting Minutes...")
-        try:
-            minutes = generate_minutes(
-                transcript,
-                meeting_title=meeting_title,
-                location=location,
-                date=date.strftime("%d-%m-%Y"),
-                time=time.strftime("%I:%M %p"),
-                attendees=attendees
-            )
-        except Exception as e:
-            st.error(f"Meeting minutes generation failed: {e}")
-            st.stop()
+    st.subheader("📄 Transcript")
+    st.text_area(
+        label="Transcript Output",
+        value=transcript,
+        height=220,
+        label_visibility="collapsed",
+        disabled=True,
+    )
 
-        st.subheader("📝 Meeting Minutes")
-        st.text_area(
-            label="Meeting Minutes Output",
-            value=minutes,
-            height=320,
-            label_visibility="collapsed"
-        )
+    st.markdown("---")
+    st.subheader("📝 Meeting Minutes")
 
-        # ---------------- Download Button ----------------
-        st.download_button(
-            label="📥 Download MoM as TXT",
-            data=minutes,
-            file_name=f"{meeting_title.replace(' ', '_')}_MoM.txt",
-            mime="text/plain"
-        )
+    version_col, regen_col = st.columns([3, 1], vertical_alignment="bottom")
+
+    # ---------------- Regenerate ----------------
+    if regen_col.button("🔄 Regenerate", width="stretch"):
+        with st.spinner("Generating a new version..."):
+            try:
+                # Higher temperature so the model actually rephrases; exact repeats are retried.
+                new_version = generate_new_version(
+                    lambda: generate_minutes(transcript, temperature=0.8), versions
+                )
+            except Exception as e:
+                st.error(f"Meeting minutes generation failed: {e}")
+                new_version = None
+            else:
+                if new_version is None:
+                    st.warning("The model kept returning an existing version. Try again.")
+        if new_version is not None:
+            versions.append(new_version)
+            st.session_state.version = len(versions) - 1
+
+    version_col.radio(
+        "Version",
+        options=range(len(versions)),
+        format_func=lambda i: f"v{i + 1}",
+        key="version",
+        horizontal=True,
+    )
+    version_index = st.session_state.version
+
+    # Editable: Copy and Download use what the user sees, and edits survive version switches.
+    minutes = st.text_area(
+        label="Meeting Minutes Output",
+        value=versions[version_index],
+        height=320,
+        label_visibility="collapsed",
+        key=f"minutes_v{version_index}",
+    )
+    versions[version_index] = minutes
+
+    # ---------------- Copy Button ----------------
+    # Writes HTML (bold headings, bullet lists) plus plain text, so pasting into
+    # Outlook/Word/Teams keeps formatting and plain editors still get clean text.
+    copy_col, download_col = st.columns(2)
+    payload = json.dumps({"html": minutes_to_html(minutes), "text": minutes}).replace("<", "\\u003c")
+    copy_col.iframe(
+        f"""
+<style>
+body {{ margin: 0; overflow: hidden; }}
+#copy {{ width: 100%; height: 40px; padding: 0 14px; border: 1px solid rgba(128,128,128,.4); border-radius: 8px; background: transparent;
+  color: var(--fg, #31333f); cursor: pointer; font: 13px "Source Sans", "Source Sans Pro", sans-serif; /* iframe falls back to wider font; 13px matches 14px Source Sans */ }}
+#copy:hover {{ border-color: #ff4b4b; color: #ff4b4b; }}
+</style>
+<button id="copy">📋 Copy Minutes</button>
+<script>
+const data = {payload};
+const btn = document.getElementById("copy");
+// The iframe is same-origin, so copy the app's live text color: the button follows the
+// Streamlit theme, not the OS one. Polled because a theme switch in Settings doesn't rerun.
+const syncColor = () => {{
+  try {{ btn.style.setProperty("--fg", getComputedStyle(parent.document.querySelector(".stApp")).color); }} catch (e) {{}}
+}};
+syncColor();
+setInterval(syncColor, 500);
+btn.onclick = async () => {{
+  try {{
+    await navigator.clipboard.write([new ClipboardItem({{
+      "text/html": new Blob([data.html], {{type: "text/html"}}),
+      "text/plain": new Blob([data.text], {{type: "text/plain"}})
+    }})]);
+    btn.textContent = "✅ Copied";
+  }} catch (e) {{
+    btn.textContent = "❌ Copy failed";
+  }}
+  setTimeout(() => btn.textContent = "📋 Copy Minutes", 2000);
+}};
+</script>
+""",
+        height=40,
+    )
+
+    # ---------------- Download Button ----------------
+    download_col.download_button(
+        label="📥 Download MoM as TXT",
+        data=minutes,
+        file_name=f"Meeting_MoM_v{version_index + 1}.txt",
+        mime="text/plain",
+        width="stretch",
+    )

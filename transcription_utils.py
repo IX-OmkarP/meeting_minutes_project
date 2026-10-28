@@ -99,3 +99,48 @@ def strip_markdown(text):
     text = re.sub(r"\*{1,3}(\S.*?\S|\S)\*{1,3}", r"\1", text)          # **bold** / *italic*
     text = text.replace("*", "").replace("#", "")                       # leftovers
     return text.strip()
+
+
+SECTION_HEADINGS = {"agenda", "decisions", "action items"}
+
+
+def minutes_to_html(text):
+    """Plain-text minutes -> HTML (bold headings, real bullet lists) for rich-text paste."""
+    import html
+
+    out, in_list = [], False
+    for line in text.splitlines():
+        stripped = line.strip()
+        is_bullet = stripped.startswith("- ")
+        if in_list and not is_bullet:
+            out.append("</ul>")
+            in_list = False
+        if is_bullet:
+            if not in_list:
+                out.append("<ul>")
+                in_list = True
+            out.append(f"<li>{html.escape(stripped[2:])}</li>")
+        elif stripped.rstrip(":").lower() in SECTION_HEADINGS:
+            out.append(f"<p><b>{html.escape(stripped.rstrip(':'))}</b></p>")
+        elif stripped:
+            out.append(f"<p>{html.escape(stripped)}</p>")
+    if in_list:
+        out.append("</ul>")
+    return "\n".join(out)
+
+
+def _normalize(text):
+    return " ".join(text.split()).lower()
+
+
+def generate_new_version(generate, versions, attempts=3):
+    """Call generate() until it returns text not already in versions (ignoring whitespace/case).
+
+    Returns None if every attempt duplicated an existing version.
+    """
+    seen = {_normalize(v) for v in versions}
+    for _ in range(attempts):
+        candidate = generate()
+        if _normalize(candidate) not in seen:
+            return candidate
+    return None
